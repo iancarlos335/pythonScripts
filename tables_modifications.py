@@ -5,13 +5,13 @@ import glob
 
 # --- CONFIGURATION ---
 # DATABASE CONNECTION DETAILS
-db_server = 'SERVER'      # Replace with your SQL Server name
-db_database = 'DATABASE'  # Replace with your database name
+db_server = 'YOUR_SERVER_NAME'      # Replace with your SQL Server name
+db_database = 'YOUR_DATABASE_NAME'  # Replace with your database name
 # table_name will be derived from the CSV filename
 
 # FOLDER CONFIGURATION
-input_csv_folder = 'CSV_INPUT_FOLDER'     # Folder containing your source .csv files
-output_sql_folder = 'SQL_OUTPUT_FOLDER'   # Folder where generated .sql files will be saved
+input_csv_folder = 'input_csvs'     # Folder containing your source .csv files
+output_sql_folder = 'output_sqls'   # Folder where generated .sql files will be saved
 
 # --- OPERATION MODE ---
 # Set to 'INSERT' to generate INSERT statements
@@ -23,78 +23,93 @@ operation_mode = 'INSERT'  # <<< CHANGE THIS TO 'INSERT' or 'UPDATE' as needed
 # This column *must* exist in your CSV files AND in the DB table for UPDATE operations.
 primary_key_column = 'ID' # <<< CHANGE THIS to your actual primary key column name
 
-# --- HELPER FUNCTION FOR SAFE SQL STRING CONVERSION ---
-def safe_sql_string_converter(value_from_cell):
-    if pd.isna(value_from_cell):
-        return 'NULL'
-    try:
-        string_representation = str(value_from_cell)
-    except Exception as e:
-        print(f"Warning: Failed to convert value '{value_from_cell}' (type: {type(value_from_cell)}) to string due to: {e}. Treating as NULL.")
-        return 'NULL'
-    if string_representation is None: # Should not happen with str() but defensive
-        return 'NULL'
-    escaped_string = string_representation.replace("'", "''")
-    return f"'{escaped_string}'"
 
-# --- FUNCTION TO GET ALL COLUMNS AND DATE COLUMNS FOR A SPECIFIC TABLE ---
+# --- FUNCTION TO GET SCHEMA INFORMATION FOR A SPECIFIC TABLE ---
 def get_table_schema_info(table_name_param, db_conn):
     """
-    Queries the database for all columns and date type columns of a specific table.
-    Returns a tuple: (list_of_all_uppercase_column_names, list_of_uppercase_date_type_column_names).
+    Queries the database for all columns and their data types using sys tables.
+    Returns a tuple: (
+        list_of_all_uppercase_column_names, 
+        list_of_uppercase_date_type_column_names,
+        list_of_uppercase_timestamp_rowversion_column_names,
+        list_of_uppercase_numeric_type_column_names,
+        boolean_has_identity_column
+    ).
     """
     all_db_columns = []
     date_db_columns = []
+    timestamp_db_columns = []
+    numeric_db_columns = []
+    has_identity_column = False
     cursor = None 
     try:
         cursor = db_conn.cursor()
-        # Query to get column names and their data types for the specified table
+        # This query joins system tables to get column name, data type, and identity property
         schema_query = f"""
-        SELECT COLUMN_NAME, DATA_TYPE 
-        FROM INFORMATION_SCHEMA.COLUMNS 
-        WHERE TABLE_NAME = '{table_name_param}'
-        ORDER BY ORDINAL_POSITION; 
+        SELECT 
+            c.name AS ColumnName,
+            t.name AS DataTypeName,
+            c.is_identity
+        FROM sys.columns c
+        INNER JOIN sys.tables tbl ON tbl.object_id = c.object_id
+        INNER JOIN sys.types t ON t.user_type_id = c.user_type_id
+        WHERE tbl.name = '{table_name_param}'
+        ORDER BY c.column_id;
         """
         cursor.execute(schema_query)
         schema_details = cursor.fetchall()
         
-        # Define list of SQL Server date types to check against
-        date_type_list_sql = ['date', 'datetime', 'datetime2', 'smalldatetime', 'datetimeoffset']
+        date_type_list = ['date', 'datetime', 'datetime2', 'smalldatetime', 'datetimeoffset']
+        timestamp_type_list = ['timestamp', 'rowversion']
+        numeric_type_list = ['decimal', 'numeric', 'float', 'real', 'money', 'smallmoney', 'int', 'bigint', 'smallint', 'tinyint', 'bit']
         
         for detail in schema_details:
-            col_name_upper = detail.COLUMN_NAME.upper()
+            col_name_upper = detail.ColumnName.upper()
+            data_type_lower = detail.DataTypeName.lower()
+
             all_db_columns.append(col_name_upper)
-            # Check if the column's data type is one of the defined date types
-            if detail.DATA_TYPE.lower() in date_type_list_sql:
+            
+            if data_type_lower in date_type_list:
                 date_db_columns.append(col_name_upper)
-        
-        if all_db_columns:
-            if date_db_columns:
-                print(f"    DB Schema for table '{table_name_param}': Date columns ({len(date_db_columns)}): {date_db_columns}")
-        else:
-            # This means the table might not exist or has no columns, which is unusual.
-            print(f"    Warning: No columns found for table '{table_name_param}' in schema, or table does not exist.")
+            elif data_type_lower in timestamp_type_list:
+                timestamp_db_columns.append(col_name_upper)
+            elif data_type_lower in numeric_type_list:
+                numeric_db_columns.append(col_name_upper)
+            
+            if detail.is_identity:
+                has_identity_column = True
             
     except pyodbc.Error as ex:
         sqlstate = ex.args[0]
         print(f"    Warning: Database query error while fetching schema for table '{table_name_param}': {sqlstate}.")
-        print(f"    Proceeding as if table '{table_name_param}' has no specific date types or columns known from DB.")
     except Exception as e:
         print(f"    An unexpected error occurred while fetching schema for table '{table_name_param}': {e}")
     finally:
-        if cursor:
-            cursor.close()
-    return all_db_columns, date_db_columns
+        if cursor: cursor.close()
+    return all_db_columns, date_db_columns, timestamp_db_columns, numeric_db_columns, has_identity_column
+
+
+# --- HELPER FUNCTION FOR TYPE-AWARE SQL VALUE FORMATTING ---
+def format_sql_value(value, is_numeric):
+    """
+    Formats a Python value into an SQL literal.
+    """
+    if pd.isna(value) or value is None:
+        return 'NULL'
+    
+    # For numeric types, just convert to string. Assumes comma-to-dot replacement has already happened.
+    if is_numeric:
+        # Also handle empty strings in numeric columns as NULL
+        str_val = str(value).strip()
+        return str_val if str_val else 'NULL'
+    
+    # For non-numeric types (strings, formatted dates), escape single quotes and wrap in quotes.
+    escaped_string = str(value).replace("'", "''")
+    return f"'{escaped_string}'"
 
 
 # --- MAIN PROCESSING ---
 def process_csv_files():
-    """
-    Reads all CSV files from the input folder, processes them, 
-    and generates corresponding SQL files in the output folder.
-    The table name is derived from the CSV filename.
-    Only columns existing in both CSV and DB table are used.
-    """
     if not os.path.exists(output_sql_folder):
         try:
             os.makedirs(output_sql_folder)
@@ -103,9 +118,7 @@ def process_csv_files():
             print(f"Error: Could not create output folder '{output_sql_folder}': {e}")
             return
 
-    csv_files_pattern = os.path.join(input_csv_folder, '*.csv')
-    csv_files = glob.glob(csv_files_pattern)
-
+    csv_files = glob.glob(os.path.join(input_csv_folder, '*.csv'))
     if not csv_files:
         print(f"No CSV files found in '{input_csv_folder}'.")
         return
@@ -115,132 +128,110 @@ def process_csv_files():
     db_conn = None
     try:
         print("Attempting to connect to the database...")
-        connection_string = f'DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={db_server};DATABASE={db_database};Trusted_Connection=yes'
-        db_conn = pyodbc.connect(connection_string)
+        db_conn = pyodbc.connect(f'DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={db_server};DATABASE={db_database};Trusted_Connection=yes')
         print("Database connection successful.")
         print("-" * 30)
 
         for csv_file_path in csv_files:
-            base_filename_with_ext = os.path.basename(csv_file_path)
-            current_table_name = os.path.splitext(base_filename_with_ext)[0]
+            base_filename = os.path.basename(csv_file_path)
+            current_table_name = os.path.splitext(base_filename)[0]
             sql_filename = current_table_name + '.sql'
             output_sql_file_path = os.path.join(output_sql_folder, sql_filename)
-            
-            print(f"\nProcessing '{base_filename_with_ext}' for table '{current_table_name}' -> SQL: '{sql_filename}'...")
 
-            # Get all DB columns and date DB columns for the current table
-            all_db_columns_for_current_table, date_type_db_columns_for_current_table = get_table_schema_info(current_table_name, db_conn)
+            all_db_cols, date_db_cols, ts_db_cols, numeric_db_cols, has_identity = get_table_schema_info(current_table_name, db_conn)
 
-            if not all_db_columns_for_current_table:
-                print(f"  Skipping CSV '{base_filename_with_ext}' as no schema information (no columns) was retrieved for table '{current_table_name}' from the database.")
+            if not all_db_cols:
+                print(f"  Skipping CSV '{base_filename}' as no schema was retrieved for table '{current_table_name}'.")
                 with open(output_sql_file_path, 'w', encoding='utf-8') as file:
-                    file.write(f"-- Skipped: No database schema (no columns) found for table '{current_table_name}'.\n")
+                    file.write(f"-- Skipped: No database schema found for table '{current_table_name}'.\n")
                 continue 
 
-            df = None
             try:
-                df = pd.read_csv(csv_file_path, dtype=str, delimiter=';') 
-            except FileNotFoundError:
-                print(f"  Error: CSV file not found at {csv_file_path}. Skipping.")
-                with open(output_sql_file_path, 'w', encoding='utf-8') as file: file.write(f"-- Error: CSV file not found at {csv_file_path}.\n")
-                continue
-            except pd.errors.EmptyDataError:
-                print(f"  Warning: CSV file '{base_filename_with_ext}' is empty. Skipping SQL generation.")
-                with open(output_sql_file_path, 'w', encoding='utf-8') as file: file.write(f"-- CSV file '{base_filename_with_ext}' was empty. No SQL generated.\n")
-                total_files_processed_successfully +=1
-                continue
+                df = pd.read_csv(csv_file_path, dtype=str, delimiter=';')
             except Exception as e:
-                print(f"  Error reading CSV file '{base_filename_with_ext}': {e}. Skipping.")
-                with open(output_sql_file_path, 'w', encoding='utf-8') as file: file.write(f"-- Error reading CSV file '{base_filename_with_ext}': {e}. No SQL generated.\n")
-                continue
-            
-            if df is None : # Should not happen if read_csv succeeds, but defensive.
-                print(f"  Error: DataFrame for '{base_filename_with_ext}' was not loaded. Skipping.")
-                with open(output_sql_file_path, 'w', encoding='utf-8') as file: file.write(f"-- DataFrame for '{base_filename_with_ext}' was not loaded. No SQL generated.\n")
+                print(f"  Error reading CSV file '{base_filename}': {e}. Skipping.")
+                with open(output_sql_file_path, 'w', encoding='utf-8') as file:
+                    file.write(f"-- Error reading CSV file '{base_filename}': {e}. No SQL generated.\n")
                 continue
 
             try:
                 if df.empty:
-                    print(f"  Warning: CSV '{base_filename_with_ext}' (table '{current_table_name}') has headers but no data. Skipping SQL generation.")
-                    with open(output_sql_file_path, 'w', encoding='utf-8') as file: file.write(f"-- CSV '{base_filename_with_ext}' (table '{current_table_name}') had no data rows. No SQL generated.\n")
+                    print(f"  Warning: CSV '{base_filename}' has headers but no data. Skipping SQL generation.")
+                    with open(output_sql_file_path, 'w', encoding='utf-8') as file:
+                        file.write(f"-- CSV '{base_filename}' had no data rows. No SQL generated.\n")
                     total_files_processed_successfully +=1
                     continue
 
-                # Standardize CSV column names (uppercase, strip whitespace)
-                original_csv_columns_standardized = [str(col).strip().upper() for col in df.columns]
-                df.columns = original_csv_columns_standardized
+                csv_cols_standardized = [str(col).strip().upper() for col in df.columns]
+                df.columns = csv_cols_standardized
 
-                # Identify columns that are in both the CSV and the DB table schema
-                # These are the only columns that will be processed and used in SQL
-                columns_to_use_in_sql = [col for col in original_csv_columns_standardized if col in all_db_columns_for_current_table]
-
+                common_cols_before_ts_filter = [col for col in csv_cols_standardized if col in all_db_cols]
+                columns_to_use_in_sql = [col for col in common_cols_before_ts_filter if col not in ts_db_cols]
+                excluded_ts_cols = [col for col in common_cols_before_ts_filter if col in ts_db_cols]
+                
                 if not columns_to_use_in_sql:
-                    print(f"  Warning: No common columns found between CSV '{base_filename_with_ext}' and DB table '{current_table_name}'. Skipping SQL generation.")
+                    print(f"  Warning: No usable columns found for '{base_filename}'. Skipping SQL generation.")
                     with open(output_sql_file_path, 'w', encoding='utf-8') as file:
-                        file.write(f"-- Skipped: No common columns between CSV and DB table '{current_table_name}'.\n")
+                        file.write(f"-- Skipped: No common/usable columns between CSV and DB table '{current_table_name}'.\n")
                     continue
                 
-                print(f"    Common columns to be used for SQL: {columns_to_use_in_sql}")
+                if excluded_ts_cols:
+                    print(f"    Excluding Timestamp/Rowversion columns: {excluded_ts_cols}")
 
-                # Create a DataFrame subset containing only the columns to be used in SQL
                 df_processed = df[columns_to_use_in_sql].copy()
 
-                # Perform date conversion only on relevant columns within df_processed
-                for col_name_for_sql in columns_to_use_in_sql: 
-                    if col_name_for_sql in date_type_db_columns_for_current_table:
-                        try:
-                            df_processed[col_name_for_sql] = pd.to_datetime(df_processed[col_name_for_sql], errors='coerce') \
-                                                             .apply(lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if pd.notnull(x) else None)
-                            print(f"      Formatted column '{col_name_for_sql}' as datetime.")
-                        except Exception as e:
-                            print(f"      Warning: Could not format column '{col_name_for_sql}' as datetime: {e}.")
-                
-                # Apply the safe SQL string converter to all columns in df_processed
-                for col_to_convert in df_processed.columns: # these are the columns_to_use_in_sql
-                    df_processed[col_to_convert] = df_processed[col_to_convert].apply(safe_sql_string_converter)
-                
+                for col in columns_to_use_in_sql:
+                    if col in date_db_cols:
+                        df_processed[col] = pd.to_datetime(df_processed[col], errors='coerce').apply(lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if pd.notnull(x) else None)
+                        print(f"      - Formatted date column: '{col}'")
+                    elif col in numeric_db_cols:
+                        df_processed[col] = df_processed[col].str.replace(',', '.', regex=False)
+
                 with open(output_sql_file_path, 'w', encoding='utf-8') as file:
-                    file.write(f"-- SQL for table: {current_table_name} from CSV: {base_filename_with_ext}\n")
-                    file.write(f"-- Using columns: {columns_to_use_in_sql}\n")
+                    file.write(f"-- SQL for table: {current_table_name} from CSV: {base_filename}\n")
+                    if excluded_ts_cols: file.write(f"-- Excluded Timestamp/Rowversion columns: {excluded_ts_cols}\n")
+                    
                     file.write("BEGIN TRY\n")
                     file.write("    BEGIN TRANSACTION;\n\n")
+
+                    # Conditionally add SET IDENTITY_INSERT ON
+                    if operation_mode.upper() == 'INSERT' and has_identity:
+                        file.write(f"    SET IDENTITY_INSERT [{current_table_name}] ON;\n\n")
                     
                     pk_col_upper = primary_key_column.upper()
 
                     for index, row in df_processed.iterrows():
-                        sql_query = ""
                         if operation_mode.upper() == 'INSERT':
-                            # Use only common columns for INSERT
+                            values_for_insert = [format_sql_value(row[col], col in numeric_db_cols) for col in columns_to_use_in_sql]
                             columns_for_insert_sql = ", ".join([f"[{col}]" for col in columns_to_use_in_sql])
-                            values_for_insert_sql = ", ".join([row[col] for col in columns_to_use_in_sql])
                             sql_query = f"    INSERT INTO [{current_table_name}] ({columns_for_insert_sql})\n"
-                            sql_query += f"    VALUES ({values_for_insert_sql});\n\n"
+                            sql_query += f"        VALUES ({', '.join(values_for_insert)});\n\n"
                         elif operation_mode.upper() == 'UPDATE':
-                            # Ensure PK is one of the common columns if we are to use it
                             if pk_col_upper not in columns_to_use_in_sql:
-                                error_msg = f"    -- ERROR: Primary Key '{primary_key_column}' (as '{pk_col_upper}') is not in the common columns for CSV '{base_filename_with_ext}' and DB table '{current_table_name}'. Row (CSV line {index + 2}) skipped for UPDATE.\n\n"
-                                file.write(error_msg)
-                                if index == 0: print(f"    Critical Error for UPDATE: PK '{pk_col_upper}' not in common columns list: {columns_to_use_in_sql}.")
+                                if index == 0: print(f"    Critical Error for UPDATE: PK '{pk_col_upper}' not in usable columns list.")
+                                file.write(f"    -- ERROR: Primary Key '{pk_col_upper}' not in usable columns list for row (CSV line {index + 2}). Skipped.\n\n")
                                 continue
                             
-                            # Create SET clauses only from common columns, excluding the PK itself
-                            set_clauses = [f"[{col_name}] = {row[col_name]}" for col_name in columns_to_use_in_sql if col_name != pk_col_upper]
+                            set_clauses = [f"[{col}] = {format_sql_value(row[col], col in numeric_db_cols)}" for col in columns_to_use_in_sql if col != pk_col_upper]
                             
                             if not set_clauses:
-                                file.write(f"    -- INFO: No columns to update for row (CSV line {index + 2}) in '{base_filename_with_ext}' (table '{current_table_name}') besides PK, or PK is the only common column. Skipping UPDATE.\n\n")
+                                file.write(f"    -- INFO: No columns to update for row (CSV line {index + 2}). Skipping.\n\n")
                                 continue
 
-                            pk_value_formatted = row[pk_col_upper] # PK value from the processed row
+                            pk_value_formatted = format_sql_value(row[pk_col_upper], pk_col_upper in numeric_db_cols)
                             sql_query = f"    UPDATE [{current_table_name}]\n"
                             sql_query += "    SET " + ",\n        ".join(set_clauses) + "\n"
                             sql_query += f"    WHERE [{pk_col_upper}] = {pk_value_formatted};\n\n"
                         else: 
-                            print(f"Critical Error: Invalid operation_mode '{operation_mode}'. Halting for this file.")
-                            file.write(f"-- ERROR: Invalid operation_mode. SQL generation stopped.\n")
+                            file.write("-- ERROR: Invalid operation_mode. SQL generation stopped.\n")
                             break 
                         file.write(sql_query)
                     
-                    if not (operation_mode.upper() != 'INSERT' and operation_mode.upper() != 'UPDATE'):
+                    # Conditionally add SET IDENTITY_INSERT OFF
+                    if operation_mode.upper() == 'INSERT' and has_identity:
+                        file.write(f"    SET IDENTITY_INSERT [{current_table_name}] OFF;\n\n")
+
+                    if operation_mode.upper() in ['INSERT', 'UPDATE']:
                         file.write("    COMMIT TRANSACTION;\n")
                         file.write("END TRY\n")
                         file.write("BEGIN CATCH\n")
@@ -249,16 +240,14 @@ def process_csv_files():
                         file.write("    THROW;\n")
                         file.write("END CATCH;\n")
                 
-                print(f"    Successfully generated SQL script: '{output_sql_file_path}'")
                 total_files_processed_successfully +=1
             except Exception as e:
-                print(f"  An unexpected error occurred while processing data from '{base_filename_with_ext}' for table '{current_table_name}': {e}")
-                with open(output_sql_file_path, 'w', encoding='utf-8') as file: file.write(f"-- Unexpected error processing data from '{base_filename_with_ext}' for table '{current_table_name}': {e}\n")
+                print(f"  An unexpected error occurred while processing data from '{base_filename}': {e}")
+                with open(output_sql_file_path, 'w', encoding='utf-8') as file: 
+                    file.write(f"-- Unexpected error processing data from '{base_filename}': {e}\n")
 
     except pyodbc.Error as ex: 
-        sqlstate = ex.args[0]
-        print(f"Fatal Database Connection Error: {sqlstate}. Cannot proceed.")
-        print("Please check database server, database name, and authentication details.")
+        print(f"Fatal Database Connection Error: {ex.args[0]}. Cannot proceed.")
     except Exception as e: 
         print(f"An unexpected error occurred during script setup or DB connection: {e}")
     finally:
@@ -268,12 +257,11 @@ def process_csv_files():
             print("Database connection closed.")
     
     print(f"\n--- Processing Complete ---")
-    print(f"Total CSV files found: {len(csv_files)}")
-    print(f"Total SQL files successfully generated or placeholders created: {total_files_processed_successfully}")
+    print(f"Total SQL files generated or placeholders created: {total_files_processed_successfully}")
 
 # --- SCRIPT EXECUTION ---
 if __name__ == '__main__':
     if operation_mode.upper() not in ['INSERT', 'UPDATE']:
-        print(f"Error: Invalid operation_mode '{operation_mode}' in configuration. Script will not run.")
+        print(f"Error: Invalid operation_mode '{operation_mode}'. Script will not run.")
     else:
         process_csv_files()
