@@ -108,6 +108,22 @@ def format_sql_value(value, is_numeric):
     return f"'{escaped_string}'"
 
 
+# --- HELPER FUNCTION TO GET SCALAR VALUE FROM ROW ---
+def get_scalar_value_from_row(r, column_name, df_ref):
+    """
+    Retrieves a scalar value from a row, handling cases where a column name
+    might represent multiple actual columns in df_ref (due to duplicates).
+    If df_ref[column_name] is a DataFrame, it means column_name was duplicated.
+    In this case, r[column_name] will be a Series, so we take the first value.
+    Otherwise, r[column_name] is already a scalar.
+    """
+    val = r[column_name]
+    # Check the structure of the DataFrame this row came from
+    if isinstance(df_ref[column_name], pd.DataFrame):
+        return val.iloc[0]  # val is a Series, take its first element
+    return val  # val is already a scalar
+
+
 # --- MAIN PROCESSING ---
 def process_csv_files():
     if not os.path.exists(output_sql_folder):
@@ -165,6 +181,19 @@ def process_csv_files():
                 csv_cols_standardized = [str(col).strip().upper() for col in df.columns]
                 df.columns = csv_cols_standardized
 
+                # --- Begin new code for warning ---
+                seen_columns = set()
+                duplicate_columns = set()
+                for col_name in df.columns:
+                    if col_name in seen_columns:
+                        duplicate_columns.add(col_name)
+                    else:
+                        seen_columns.add(col_name)
+
+                if duplicate_columns:
+                    print(f"  Warning: Duplicate column names found in CSV '{base_filename}' after standardization: {list(duplicate_columns)}")
+                # --- End new code for warning ---
+
                 common_cols_before_ts_filter = [col for col in csv_cols_standardized if col in all_db_cols]
                 columns_to_use_in_sql = [col for col in common_cols_before_ts_filter if col not in ts_db_cols]
                 excluded_ts_cols = [col for col in common_cols_before_ts_filter if col in ts_db_cols]
@@ -182,13 +211,30 @@ def process_csv_files():
 
                 for col in columns_to_use_in_sql:
                     if col in date_db_cols:
-                        df_processed[col] = pd.to_datetime(df_processed[col], errors='coerce').apply(lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if pd.notnull(x) else None)
+                        if isinstance(df_processed[col], pd.DataFrame):
+                            print(f"    Warning: Duplicate column name '{col}' encountered in date processing. Applying to each instance.")
+                            for i in range(df_processed[col].shape[1]): # Iterate through actual columns if it's a DataFrame
+                                df_processed[col].iloc[:, i] = pd.to_datetime(df_processed[col].iloc[:, i], errors='coerce').apply(lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if pd.notnull(x) else None)
+                        elif isinstance(df_processed[col], pd.Series):
+                            df_processed[col] = pd.to_datetime(df_processed[col], errors='coerce').apply(lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if pd.notnull(x) else None)
+                        else:
+                            print(f"    Warning: Column '{col}' in date_db_cols is neither Series nor DataFrame. Type: {type(df_processed[col])}. Skipping formatting.")
                         print(f"      - Formatted date column: '{col}'")
                     elif col in numeric_db_cols:
-                        df_processed[col] = df_processed[col].str.replace(',', '.', regex=False)
+                        if isinstance(df_processed[col], pd.DataFrame):
+                            print(f"    Info: Handling multiple instances for numeric column '{col}' due to duplicate names.")
+                            for i in range(df_processed[col].shape[1]): # Iterate through actual columns if it's a DataFrame
+                                df_processed[col].iloc[:, i] = df_processed[col].iloc[:, i].str.replace(',', '.', regex=False)
+                        elif isinstance(df_processed[col], pd.Series):
+                            df_processed[col] = df_processed[col].str.replace(',', '.', regex=False)
+                        else:
+                            # Should not happen if col is in df_processed.columns
+                            print(f"    Warning: Column '{col}' in numeric_db_cols is neither Series nor DataFrame. Type: {type(df_processed[col])}. Skipping replacement.")
 
                 with open(output_sql_file_path, 'w', encoding='utf-8') as file:
                     file.write(f"-- SQL for table: {current_table_name} from CSV: {base_filename}\n")
+                    if duplicate_columns: # Check if the set is not empty
+                        file.write(f"-- WARNING: Duplicate column names found in source CSV after standardization: {sorted(list(duplicate_columns))}\n") # Writing sorted list
                     if excluded_ts_cols: file.write(f"-- Excluded Timestamp/Rowversion columns: {excluded_ts_cols}\n")
                     
                     file.write("BEGIN TRY\n")
@@ -202,23 +248,23 @@ def process_csv_files():
 
                     for index, row in df_processed.iterrows():
                         if operation_mode.upper() == 'INSERT':
-                            values_for_insert = [format_sql_value(row[col], col in numeric_db_cols) for col in columns_to_use_in_sql]
+                            values_for_insert = [format_sql_value(get_scalar_value_from_row(row, col, df_processed), col in numeric_db_cols) for col in columns_to_use_in_sql]
                             columns_for_insert_sql = ", ".join([f"[{col}]" for col in columns_to_use_in_sql])
                             sql_query = f"    INSERT INTO [{current_table_name}] ({columns_for_insert_sql})\n"
                             sql_query += f"        VALUES ({', '.join(values_for_insert)});\n\n"
                         elif operation_mode.upper() == 'UPDATE':
-                            if pk_col_upper not in columns_to_use_in_sql:
-                                if index == 0: print(f"    Critical Error for UPDATE: PK '{pk_col_upper}' not in usable columns list.")
-                                file.write(f"    -- ERROR: Primary Key '{pk_col_upper}' not in usable columns list for row (CSV line {index + 2}). Skipped.\n\n")
+                            if pk_col_upper not in columns_to_use_in_sql: # This check remains valid as columns_to_use_in_sql has unique names based on selection logic
+                                if index == 0: print(f"    Critical Error for UPDATE: PK '{pk_col_upper}' not in usable columns list for table '{current_table_name}'.")
+                                file.write(f"    -- ERROR: Primary Key '{pk_col_upper}' not in usable columns list for row (CSV line {index + 2}) in table '{current_table_name}'. Skipped.\n\n")
                                 continue
                             
-                            set_clauses = [f"[{col}] = {format_sql_value(row[col], col in numeric_db_cols)}" for col in columns_to_use_in_sql if col != pk_col_upper]
+                            set_clauses = [f"[{col}] = {format_sql_value(get_scalar_value_from_row(row, col, df_processed), col in numeric_db_cols)}" for col in columns_to_use_in_sql if col != pk_col_upper]
                             
                             if not set_clauses:
-                                file.write(f"    -- INFO: No columns to update for row (CSV line {index + 2}). Skipping.\n\n")
+                                file.write(f"    -- INFO: No columns to update for row (CSV line {index + 2}) in table '{current_table_name}'. Skipping.\n\n")
                                 continue
 
-                            pk_value_formatted = format_sql_value(row[pk_col_upper], pk_col_upper in numeric_db_cols)
+                            pk_value_formatted = format_sql_value(get_scalar_value_from_row(row, pk_col_upper, df_processed), pk_col_upper in numeric_db_cols)
                             sql_query = f"    UPDATE [{current_table_name}]\n"
                             sql_query += "    SET " + ",\n        ".join(set_clauses) + "\n"
                             sql_query += f"    WHERE [{pk_col_upper}] = {pk_value_formatted};\n\n"
