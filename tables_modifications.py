@@ -29,6 +29,7 @@ table_list_file = 'tables_to_fetch.txt' # File with list of tables to fetch from
 # --- DATA FETCHING CONFIGURATION ---
 source_where_column = 'YOUR_WHERE_COLUMN' # Column to use in the WHERE clause for fetching data from source AND for pre-delete on target
 source_where_value = 'SOME_VALUE'         # Value for the WHERE clause (may need to be dynamic)
+source_where_negate = False               # Set to True to use '<>' instead of '=' in the WHERE clause (negate condition)
 
 # --- TARGET TABLE PRE-OPERATION ---
 execute_pre_delete_on_target = False # SET TO TRUE to enable deleting rows from target table based on source_where_column/value before inserts/updates
@@ -175,7 +176,8 @@ def process_data_and_generate_sql(): # Renamed from process_csv_files
         where_value=source_where_value,
         trusted_conn=source_db_trusted_connection,
         uid=source_db_uid,
-        pwd=source_db_pwd
+        pwd=source_db_pwd,
+        negate=source_where_negate
     )
 
     if not fetched_data_map:
@@ -229,7 +231,8 @@ def process_data_and_generate_sql(): # Renamed from process_csv_files
                     # For simplicity now, assume tables exist if they are in fetched_data_map.
                     # A more robust check: cursor.tables(table=current_table_name, tableType='TABLE').fetchone()
 
-                    delete_sql = f"DELETE FROM [{current_table_name}] WHERE [{source_where_column}] = ?;"
+                    operator = '<>' if source_where_negate else '='
+                    delete_sql = f"DELETE FROM [{current_table_name}] WHERE [{source_where_column}] {operator} ?;"
                     print(f"    Executing: {delete_sql} (Parameter: '{source_where_value}')")
                     
                     # Execute the delete command
@@ -479,14 +482,15 @@ def create_db_connection(server, database, driver, trusted_connection=True, user
         return None
 
 # --- FUNCTION TO FETCH DATA FOR A SINGLE TABLE ---
-def fetch_data_for_table(db_conn, table_name, where_column, where_value):
+def fetch_data_for_table(db_conn, table_name, where_column, where_value, negate=False):
     """
     Fetches data from a specific table based on a WHERE condition.
     Returns a pandas DataFrame or None if an error occurs.
     """
-    query = f"SELECT * FROM [{table_name}] WHERE [{where_column}] = ?"
+    operator = '<>' if negate else '='
+    query = f"SELECT * FROM [{table_name}] WHERE [{where_column}] {operator} ?"
     try:
-        print(f"Fetching data from table '{table_name}' with WHERE [{where_column}] = '{where_value}'...")
+        print(f"Fetching data from table '{table_name}' with WHERE [{where_column}] {operator} '{where_value}'...")
         # Using parameters for the query is safer (prevents SQL injection)
         df = pd.read_sql_query(query, db_conn, params=[where_value])
         print(f"Successfully fetched {len(df)} rows from '{table_name}'.")
@@ -515,7 +519,8 @@ def fetch_all_data_from_source(
     where_value, 
     trusted_conn=True, 
     uid=None, 
-    pwd=None
+    pwd=None,
+    negate=False
 ):
     """
     Orchestrates the fetching of data for multiple tables from the source database.
@@ -539,7 +544,7 @@ def fetch_all_data_from_source(
     try:
         for table_name in table_names:
             print(f"\n--- Processing table: {table_name} ---")
-            df = fetch_data_for_table(db_conn, table_name, where_column, where_value)
+            df = fetch_data_for_table(db_conn, table_name, where_column, where_value, negate)
             if df is not None:
                 all_data[table_name] = df
             else:
