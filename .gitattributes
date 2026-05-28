@@ -1,0 +1,19 @@
+# Set default behavior to force CRLF line endings for all text files on checkout
+* text eol=crlf
+
+# Explicitly ensure source files are treated as text and use CRLF
+*.py text eol=crlf
+*.md text eol=crlf
+*.json text eol=crlf
+*.yml text eol=crlf
+*.yaml text eol=crlf
+*.editorconfig text eol=crlf
+*.gitattributes text eol=crlf
+*.gitignore text eol=crlf
+
+# Keep binary files as binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
