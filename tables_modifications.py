@@ -110,6 +110,92 @@ def get_table_schema_info(table_name_param, db_conn):
     return all_db_columns, date_db_columns, timestamp_db_columns, numeric_db_columns, has_identity_column
 
 
+# --- FUNCTION TO ORDER TABLES BY FOREIGN KEY DEPENDENCY (TARGET DATABASE) ---
+def get_fk_dependency_order(table_names, db_conn):
+    """
+    Reorders `table_names` so FK parent (referenced) tables come before
+    child (referencing) tables, based on sys.foreign_keys on `db_conn`
+    (must be the TARGET connection - target schema is authoritative here).
+    Use reversed(...) on the result for a safe DELETE order.
+    Case-insensitive matching; self-referencing FKs are ignored for ordering;
+    FKs to tables outside `table_names` are ignored; true cycles are broken by
+    appending the unresolved subset in original relative order plus a warning
+    (never raises). Duplicate/differently-cased entries in `table_names` are
+    preserved in the output.
+    """
+    if not table_names:
+        return list(table_names)
+
+    unique_upper_nodes = list(dict.fromkeys(t.upper() for t in table_names))
+    in_degree = {n: 0 for n in unique_upper_nodes}
+    children_of = {n: set() for n in unique_upper_nodes}
+    self_referencing = set()
+
+    cursor = None
+    try:
+        cursor = db_conn.cursor()
+        placeholders = ", ".join(["?"] * len(unique_upper_nodes))
+        fk_query = f"""
+            SELECT tc.name AS ChildTable, tp.name AS ParentTable
+            FROM sys.foreign_keys fk
+            INNER JOIN sys.tables tc ON tc.object_id = fk.parent_object_id
+            INNER JOIN sys.tables tp ON tp.object_id = fk.referenced_object_id
+            WHERE UPPER(tc.name) IN ({placeholders})
+              AND UPPER(tp.name) IN ({placeholders})
+        """
+        cursor.execute(fk_query, unique_upper_nodes + unique_upper_nodes)
+        for row in cursor.fetchall():
+            child_u, parent_u = row.ChildTable.upper(), row.ParentTable.upper()
+            if child_u == parent_u:
+                self_referencing.add(child_u)  # self-FK: skip, no false cycle
+                continue
+            if child_u not in children_of[parent_u]:  # dedupe multi-FK same pair
+                children_of[parent_u].add(child_u)
+                in_degree[child_u] += 1
+    except pyodbc.Error as ex:
+        print(f"  Warning: Could not query FK metadata for dependency ordering: {ex.args[0]}. "
+              f"Falling back to original table order.")
+        return list(table_names)
+    except Exception as e:
+        print(f"  Warning: Unexpected error querying FK metadata: {e}. Falling back to original table order.")
+        return list(table_names)
+    finally:
+        if cursor: cursor.close()
+
+    if self_referencing:
+        print(f"  Note: Ignoring self-referencing FK(s) for ordering purposes on: {sorted(self_referencing)}")
+
+    ordered_upper = []
+    remaining = list(unique_upper_nodes)  # preserves original relative order
+    while remaining:
+        pick_idx = next((i for i, n in enumerate(remaining) if in_degree[n] == 0), None)
+        if pick_idx is None:
+            break  # nothing left with in_degree 0 -> cycle among `remaining`
+        n = remaining.pop(pick_idx)
+        ordered_upper.append(n)
+        for child in children_of[n]:
+            in_degree[child] -= 1
+
+    if remaining:
+        print(f"  WARNING: Circular FK reference detected among: {remaining}. "
+              f"Cannot fully resolve dependency order for these tables; appending them in their "
+              f"original relative order. Manual review recommended if FK constraint errors occur.")
+        ordered_upper.extend(remaining)  # `remaining` still in original relative order
+
+    rank_of_upper = {u: i for i, u in enumerate(ordered_upper)}
+    ordered_table_names = sorted(table_names, key=lambda t: rank_of_upper.get(t.upper(), len(ordered_upper)))
+
+    if [t.upper() for t in ordered_table_names] != [t.upper() for t in table_names]:
+        print("  FK dependency reordering applied (parents before children):")
+        print(f"    Original : {list(table_names)}")
+        print(f"    Reordered: {ordered_table_names}")
+    else:
+        print("  No FK-driven reordering necessary; original order already satisfies parent-before-child "
+              "constraints (or no relevant FKs among these tables).")
+
+    return ordered_table_names
+
+
 # --- HELPER FUNCTION FOR TYPE-AWARE SQL VALUE FORMATTING ---
 def format_sql_value(value, is_numeric):
     """
@@ -165,33 +251,16 @@ def get_scalar_value_from_row(r, column_name, df_ref):
 
 # --- MAIN PROCESSING ---
 def process_data_and_generate_sql(): # Renamed from process_csv_files
-    # --- Fetch all data from the source database ---
-    # Note: Add relevant parameters for trusted_conn, uid, pwd if not using trusted connection for source
-    fetched_data_map = fetch_all_data_from_source(
-        table_list_filepath=table_list_file,
-        server=source_db_server,
-        database=source_db_database,
-        driver=source_db_driver,
-        where_column=source_where_column,
-        where_value=source_where_value,
-        trusted_conn=source_db_trusted_connection,
-        uid=source_db_uid,
-        pwd=source_db_pwd,
-        negate=source_where_negate
-    )
-
-    if not fetched_data_map:
-        print("No data fetched from source. Exiting SQL execution process.") # Changed "generation" to "execution"
+    raw_table_names = get_table_names_from_file(table_list_file)
+    if not raw_table_names:
+        print("No table names found. Exiting SQL execution process.")
         return
 
-    # Removed output_sql_folder creation logic
-    
-    print(f"\nStarting SQL operations for {len(fetched_data_map)} tables.")
     tables_attempted_in_delete_pass = 0
     tables_deleted_successfully = 0
     tables_attempted_in_data_pass = 0
     total_tables_committed_successfully = 0
-    
+
     target_db_conn = None
 
     try:
@@ -210,10 +279,37 @@ def process_data_and_generate_sql(): # Renamed from process_csv_files
         print("Target database connection successful.")
         print("-" * 40)
 
-        # --- PRE-DELETION PASS ---
+        # --- FK DEPENDENCY ORDERING (based on TARGET schema) ---
+        print("\n--- Computing FK Dependency Order (TARGET database) ---")
+        ordered_table_names = get_fk_dependency_order(raw_table_names, target_db_conn)
+        print("-" * 40)
+
+        # --- Fetch all data from the source database, in FK-resolved order ---
+        # Note: Add relevant parameters for trusted_conn, uid, pwd if not using trusted connection for source
+        fetched_data_map = fetch_all_data_from_source(
+            table_names=ordered_table_names,
+            server=source_db_server,
+            database=source_db_database,
+            driver=source_db_driver,
+            where_column=source_where_column,
+            where_value=source_where_value,
+            trusted_conn=source_db_trusted_connection,
+            uid=source_db_uid,
+            pwd=source_db_pwd,
+            negate=source_where_negate
+        )
+
+        if not fetched_data_map:
+            print("No data fetched from source. Exiting SQL execution process.") # Changed "generation" to "execution"
+            return
+
+        print(f"\nStarting SQL operations for {len(fetched_data_map)} tables.")
+
+        # --- PRE-DELETION PASS (reverse FK order: children before parents) ---
         if execute_pre_delete_on_target:
-            print("\n--- Starting Pre-Deletion Pass ---")
-            table_names_for_processing = list(fetched_data_map.keys()) 
+            print("\n--- Starting Pre-Deletion Pass (child-first / reverse FK order) ---")
+            table_names_for_processing = list(reversed(list(fetched_data_map.keys())))
+            print(f"  Delete order: {table_names_for_processing}")
             for i, current_table_name in enumerate(table_names_for_processing):
                 tables_attempted_in_delete_pass += 1
                 print(f"\nPre-Deleting from table ({tables_attempted_in_delete_pass}/{len(table_names_for_processing)}): '{current_table_name}'")
@@ -275,8 +371,9 @@ def process_data_and_generate_sql(): # Renamed from process_csv_files
             print("\nSkipping Pre-Deletion Pass as `execute_pre_delete_on_target` is False.")
             print("-" * 40)
 
-        # --- DATA INSERTION/UPDATE PASS ---
-        print("\n--- Starting Data Insertion/Update Pass ---")
+        # --- DATA INSERTION/UPDATE PASS (FK order: parents before children) ---
+        print("\n--- Starting Data Insertion/Update Pass (parent-first FK order) ---")
+        print(f"  Insert/Update order: {list(fetched_data_map.keys())}")
         for current_table_name, df in fetched_data_map.items():
             tables_attempted_in_data_pass += 1
             print(f"\nProcessing Data for table ({tables_attempted_in_data_pass}/{len(fetched_data_map)}): '{current_table_name}'")
@@ -511,27 +608,25 @@ def fetch_data_for_table(db_conn, table_name, where_column, where_value, negate=
 
 # --- ORCHESTRATOR FUNCTION FOR DATA FETCHING ---
 def fetch_all_data_from_source(
-    table_list_filepath, 
-    server, 
-    database, 
-    driver, 
-    where_column, 
-    where_value, 
-    trusted_conn=True, 
-    uid=None, 
+    table_names,
+    server,
+    database,
+    driver,
+    where_column,
+    where_value,
+    trusted_conn=True,
+    uid=None,
     pwd=None,
     negate=False
 ):
     """
     Orchestrates the fetching of data for multiple tables from the source database.
-    1. Reads table names from the specified file.
-    2. Connects to the source database.
-    3. For each table, fetches data based on the WHERE condition.
-    4. Returns a dictionary of DataFrames {table_name: DataFrame}.
+    1. Connects to the source database.
+    2. For each table (in the given order), fetches data based on the WHERE condition.
+    3. Returns a dictionary of DataFrames {table_name: DataFrame}, preserving `table_names` order.
     """
     all_data = {}
-    
-    table_names = get_table_names_from_file(table_list_filepath)
+
     if not table_names:
         print("No table names to process. Exiting data fetching.")
         return all_data

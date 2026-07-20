@@ -19,6 +19,7 @@ A powerful row-by-row table synchronizer that fetches records from a source data
   - Smart handling of Microsoft SQL Server `IDENTITY_INSERT` states.
   - **Flexible WHERE Filter & Negation**: Filter records based on `source_where_column` and `source_where_value`. Supports conditional negation using `source_where_negate = True` (converts query operators from `=` to `<>`).
   - **Target Pre-deletion**: Delete rows matching/excluding the where filter on the target database prior to executing writes.
+  - **FK-Aware Table Ordering**: Automatically reorders the tables listed in `tables_to_fetch.txt` based on foreign key relationships in the target database — parent tables are inserted/updated before their children, and pre-deletion runs in the reverse (child-first) order, avoiding FK constraint violations.
 
 #### 🔄 [db_sync.py](file:///C:/Barao/Projetos/pythonScripts/db_sync.py)
 A structural database synchronization script that reads schemas and database objects from a source MS SQL Server and recreates them on a destination database.
