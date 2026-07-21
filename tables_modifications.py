@@ -50,11 +50,12 @@ def get_table_schema_info(table_name_param, db_conn):
     """
     Queries the database for all columns and their data types using sys tables.
     Returns a tuple: (
-        list_of_all_uppercase_column_names, 
+        list_of_all_uppercase_column_names,
         list_of_uppercase_date_type_column_names,
         list_of_uppercase_timestamp_rowversion_column_names,
         list_of_uppercase_numeric_type_column_names,
-        boolean_has_identity_column
+        boolean_has_identity_column,
+        identity_column_name_or_none
     ).
     """
     all_db_columns = []
@@ -62,7 +63,8 @@ def get_table_schema_info(table_name_param, db_conn):
     timestamp_db_columns = []
     numeric_db_columns = []
     has_identity_column = False
-    cursor = None 
+    identity_column_name = None
+    cursor = None
     try:
         cursor = db_conn.cursor()
         # This query joins system tables to get column name, data type, and identity property
@@ -99,7 +101,8 @@ def get_table_schema_info(table_name_param, db_conn):
             
             if detail.is_identity:
                 has_identity_column = True
-            
+                identity_column_name = col_name_upper
+
     except pyodbc.Error as ex:
         sqlstate = ex.args[0]
         print(f"    Warning: Database query error while fetching schema for table '{table_name_param}': {sqlstate}.")
@@ -107,7 +110,7 @@ def get_table_schema_info(table_name_param, db_conn):
         print(f"    An unexpected error occurred while fetching schema for table '{table_name_param}': {e}")
     finally:
         if cursor: cursor.close()
-    return all_db_columns, date_db_columns, timestamp_db_columns, numeric_db_columns, has_identity_column
+    return all_db_columns, date_db_columns, timestamp_db_columns, numeric_db_columns, has_identity_column, identity_column_name
 
 
 # --- FUNCTION TO ORDER TABLES BY FOREIGN KEY DEPENDENCY (TARGET DATABASE) ---
@@ -378,7 +381,7 @@ def process_data_and_generate_sql(): # Renamed from process_csv_files
             tables_attempted_in_data_pass += 1
             print(f"\nProcessing Data for table ({tables_attempted_in_data_pass}/{len(fetched_data_map)}): '{current_table_name}'")
 
-            all_db_cols, date_db_cols, ts_db_cols, numeric_db_cols, has_identity = get_table_schema_info(current_table_name, target_db_conn)
+            all_db_cols, date_db_cols, ts_db_cols, numeric_db_cols, has_identity, identity_column_name = get_table_schema_info(current_table_name, target_db_conn)
 
             if not all_db_cols:
                 print(f"  Skipping data operations for table '{current_table_name}' as no schema was retrieved from TARGET database.")
@@ -409,6 +412,10 @@ def process_data_and_generate_sql(): # Renamed from process_csv_files
                     continue
                 if excluded_ts_cols:
                     print(f"    Excluding Timestamp/Rowversion columns from SQL operations: {excluded_ts_cols}")
+
+                identity_insert_needed = has_identity and identity_column_name in columns_to_use_in_sql
+                if has_identity and not identity_insert_needed:
+                    print(f"    Identity column '{identity_column_name}' not present in source data for table '{current_table_name}' — skipping SET IDENTITY_INSERT; target will auto-generate values.")
 
                 df_processed = df[columns_to_use_in_sql].copy()
                 for col in columns_to_use_in_sql: # Data type conversions
@@ -441,7 +448,7 @@ def process_data_and_generate_sql(): # Renamed from process_csv_files
                     cursor = target_db_conn.cursor()
                     print(f"    Executing data operations for table '{current_table_name}'. {len(df_processed)} rows to process.")
 
-                    if operation_mode.upper() == 'INSERT' and has_identity:
+                    if operation_mode.upper() == 'INSERT' and identity_insert_needed:
                         identity_insert_on_sql = f"SET IDENTITY_INSERT [{current_table_name}] ON;"
                         print(f"      Executing: {identity_insert_on_sql}")
                         cursor.execute(identity_insert_on_sql)
@@ -482,7 +489,7 @@ def process_data_and_generate_sql(): # Renamed from process_csv_files
                         if processed_row_count_for_table % log_every_n_rows == 0:
                             print(f"        ... processed {processed_row_count_for_table} rows ...")
 
-                    if operation_mode.upper() == 'INSERT' and has_identity:
+                    if operation_mode.upper() == 'INSERT' and identity_insert_needed:
                         identity_insert_off_sql = f"SET IDENTITY_INSERT [{current_table_name}] OFF;"
                         print(f"      Executing: {identity_insert_off_sql}")
                         cursor.execute(identity_insert_off_sql)
