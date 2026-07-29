@@ -308,6 +308,8 @@ def process_data_and_generate_sql(): # Renamed from process_csv_files
 
         print(f"\nStarting SQL operations for {len(fetched_data_map)} tables.")
 
+        tables_blocked_by_delete_guard = set()
+
         # --- PRE-DELETION PASS (reverse FK order: children before parents) ---
         if execute_pre_delete_on_target:
             print("\n--- Starting Pre-Deletion Pass (child-first / reverse FK order) ---")
@@ -337,12 +339,26 @@ def process_data_and_generate_sql(): # Renamed from process_csv_files
                     # Execute the delete command
                     cursor.execute(delete_sql, source_where_value)
                     deleted_rows_count = cursor.rowcount
-                    
+
                     # Commit the delete for this table
-                    target_db_conn.commit() 
-                    
-                    print(f"    Successfully deleted {deleted_rows_count if deleted_rows_count != -1 else 'an unconfirmed number of'} rows from '{current_table_name}' and committed changes.")
-                    tables_deleted_successfully += 1
+                    target_db_conn.commit()
+
+                    # Verify the delete actually took effect: a target-side trigger
+                    # (e.g. an INSTEAD OF DELETE guard) can intercept the DELETE and
+                    # leave matching rows in place while still reporting a rowcount,
+                    # so rowcount alone cannot be trusted as proof of deletion.
+                    verify_sql = f"SELECT COUNT(*) FROM [{current_table_name}] WHERE [{source_where_column}] {operator} ?;"
+                    cursor.execute(verify_sql, source_where_value)
+                    remaining_row_count = cursor.fetchone()[0]
+
+                    if remaining_row_count > 0:
+                        print(f"    WARNING: {remaining_row_count} row(s) still present in '{current_table_name}' after DELETE + commit. "
+                              f"The delete was likely intercepted by a trigger or blocked by a business rule (e.g. an INSTEAD OF DELETE guard). "
+                              f"Skipping data insert for this table to avoid a certain PK violation.")
+                        tables_blocked_by_delete_guard.add(current_table_name)
+                    else:
+                        print(f"    Successfully deleted {deleted_rows_count if deleted_rows_count != -1 else 'an unconfirmed number of'} rows from '{current_table_name}' and committed changes.")
+                        tables_deleted_successfully += 1
 
                 except pyodbc.Error as del_err:
                     error_code = del_err.args[0]
@@ -380,6 +396,11 @@ def process_data_and_generate_sql(): # Renamed from process_csv_files
         for current_table_name, df in fetched_data_map.items():
             tables_attempted_in_data_pass += 1
             print(f"\nProcessing Data for table ({tables_attempted_in_data_pass}/{len(fetched_data_map)}): '{current_table_name}'")
+
+            if current_table_name in tables_blocked_by_delete_guard:
+                print(f"  Skipping data insert for '{current_table_name}': pre-delete did not actually remove the matching rows "
+                      f"(see WARNING above) and inserting now would hit a certain PK violation.")
+                continue
 
             all_db_cols, date_db_cols, ts_db_cols, numeric_db_cols, has_identity, identity_column_name = get_table_schema_info(current_table_name, target_db_conn)
 
@@ -529,6 +550,9 @@ def process_data_and_generate_sql(): # Renamed from process_csv_files
     print(f"\n--- SQL Execution Process Summary ---")
     if execute_pre_delete_on_target:
         print(f"Pre-Deletion Pass: Attempted on {tables_attempted_in_delete_pass} tables, Successfully deleted from {tables_deleted_successfully} tables.")
+        if tables_blocked_by_delete_guard:
+            print(f"Pre-Deletion Pass: {len(tables_blocked_by_delete_guard)} table(s) blocked by a target-side trigger/rule — "
+                  f"data insert skipped for these tables: {sorted(tables_blocked_by_delete_guard)}")
     print(f"Data Insertion/Update Pass: Attempted on {tables_attempted_in_data_pass} tables, Successfully committed for {total_tables_committed_successfully} tables.")
     
     # Overall success might be defined differently now.
