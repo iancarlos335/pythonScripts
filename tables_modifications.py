@@ -37,7 +37,10 @@ execute_pre_delete_on_target = False # SET TO TRUE to enable deleting rows from 
 # --- OPERATION MODE ---
 # Set to 'INSERT' to generate INSERT statements
 # Set to 'UPDATE' to generate UPDATE statements
-operation_mode = 'INSERT'  # <<< CHANGE THIS TO 'INSERT' or 'UPDATE' as needed
+# Set to 'DELETE' to delete rows from the target matching source_where_column/source_where_value.
+#   DELETE mode never fetches from the source database (no source SELECT is needed) and ignores
+#   `execute_pre_delete_on_target` (the mode itself performs the delete).
+operation_mode = 'INSERT'  # <<< CHANGE THIS TO 'INSERT', 'UPDATE' or 'DELETE' as needed
 
 # --- FOR UPDATE OPERATIONS ONLY ---
 # Specify the primary key column name used in the WHERE clause for UPDATEs.
@@ -199,6 +202,88 @@ def get_fk_dependency_order(table_names, db_conn):
     return ordered_table_names
 
 
+# --- FUNCTION TO RUN A SET-BASED DELETE PASS OVER MULTIPLE TABLES (TARGET DATABASE) ---
+def run_delete_pass(table_names, target_db_conn, where_column, where_value, negate, pass_label="Delete"):
+    """
+    Executes a set-based `DELETE FROM [table] WHERE [where_column] {=|<>} ?` against each table
+    in `table_names` (caller is responsible for FK-safe, e.g. child-first, ordering), verifying
+    afterwards that no matching rows remain (a target-side INSTEAD OF DELETE trigger can otherwise
+    silently block the delete while still reporting a rowcount).
+    Returns (attempted_count, deleted_count, blocked_table_names_set).
+    """
+    attempted = 0
+    deleted = 0
+    blocked = set()
+
+    print(f"\n--- Starting {pass_label} Pass ---")
+    print(f"  Delete order: {table_names}")
+
+    for current_table_name in table_names:
+        attempted += 1
+        print(f"\n{pass_label} from table ({attempted}/{len(table_names)}): '{current_table_name}'")
+
+        if not where_column or where_column.strip() == "":
+            print(f"  WARNING: `source_where_column` is not defined or empty. Skipping {pass_label.lower()} for table '{current_table_name}'.")
+            continue
+
+        cursor = None
+        try:
+            cursor = target_db_conn.cursor()
+            operator = '<>' if negate else '='
+            delete_sql = f"DELETE FROM [{current_table_name}] WHERE [{where_column}] {operator} ?;"
+            print(f"    Executing: {delete_sql} (Parameter: '{where_value}')")
+
+            cursor.execute(delete_sql, where_value)
+            deleted_rows_count = cursor.rowcount
+
+            target_db_conn.commit()
+
+            # Verify the delete actually took effect: a target-side trigger
+            # (e.g. an INSTEAD OF DELETE guard) can intercept the DELETE and
+            # leave matching rows in place while still reporting a rowcount,
+            # so rowcount alone cannot be trusted as proof of deletion.
+            verify_sql = f"SELECT COUNT(*) FROM [{current_table_name}] WHERE [{where_column}] {operator} ?;"
+            cursor.execute(verify_sql, where_value)
+            remaining_row_count = cursor.fetchone()[0]
+
+            if remaining_row_count > 0:
+                print(f"    WARNING: {remaining_row_count} row(s) still present in '{current_table_name}' after DELETE + commit. "
+                      f"The delete was likely intercepted by a trigger or blocked by a business rule (e.g. an INSTEAD OF DELETE guard). "
+                      f"Skipping data insert for this table to avoid a certain PK violation.")
+                blocked.add(current_table_name)
+            else:
+                print(f"    Successfully deleted {deleted_rows_count if deleted_rows_count != -1 else 'an unconfirmed number of'} rows from '{current_table_name}' and committed changes.")
+                deleted += 1
+
+        except pyodbc.Error as del_err:
+            error_code = del_err.args[0]
+            error_message = str(del_err)
+            print(f"    DATABASE ERROR during {pass_label} for table '{current_table_name}' (Code: {error_code}): {error_message}")
+            try:
+                # Rollback in case the error left the transaction in an uncommittable state
+                target_db_conn.rollback()
+                print(f"    Rolled back transaction for table '{current_table_name}' due to {pass_label.lower()} error.")
+            except pyodbc.Error as rb_err:
+                print(f"      CRITICAL: Failed to ROLLBACK after {pass_label.lower()} error for table '{current_table_name}': {rb_err}. Connection might be unstable.")
+        except Exception as e_del_generic:
+            print(f"    UNEXPECTED NON-DATABASE ERROR during {pass_label} for table '{current_table_name}': {e_del_generic}")
+            # Non-pyodbc errors might not require a DB rollback unless a transaction was started and not handled by pyodbc layer.
+            # For safety, attempt rollback if connection seems active.
+            if target_db_conn and not target_db_conn.closed:
+                try:
+                    target_db_conn.rollback()
+                    print(f"    Attempted rollback for table '{current_table_name}' due to unexpected {pass_label.lower()} error.")
+                except pyodbc.Error as rb_err:
+                    print(f"      CRITICAL: Failed to ROLLBACK after unexpected {pass_label.lower()} error for table '{current_table_name}': {rb_err}. Connection might be unstable.")
+        finally:
+            if cursor:
+                cursor.close()
+
+    print(f"--- {pass_label} Pass Complete ---")
+    print("-" * 40)
+    return attempted, deleted, blocked
+
+
 # --- HELPER FUNCTION FOR TYPE-AWARE SQL VALUE FORMATTING ---
 def format_sql_value(value, is_numeric):
     """
@@ -287,6 +372,27 @@ def process_data_and_generate_sql(): # Renamed from process_csv_files
         ordered_table_names = get_fk_dependency_order(raw_table_names, target_db_conn)
         print("-" * 40)
 
+        # --- DELETE OPERATION MODE: set-based delete only, no source fetch needed ---
+        if operation_mode.upper() == 'DELETE':
+            print("\nOperation mode is DELETE: skipping source data fetch — a source SELECT is not "
+                  "needed for a set-based DELETE driven by source_where_column/source_where_value.")
+            if execute_pre_delete_on_target:
+                print("  Note: `execute_pre_delete_on_target` is ignored in DELETE mode (the operation itself performs the delete).")
+
+            delete_table_order = list(reversed(ordered_table_names))
+            tables_attempted_in_delete_pass, tables_deleted_successfully, tables_blocked_by_delete_guard = run_delete_pass(
+                delete_table_order, target_db_conn, source_where_column, source_where_value, source_where_negate,
+                pass_label="DELETE Operation"
+            )
+
+            print(f"\n--- SQL Execution Process Summary ---")
+            print(f"DELETE Operation Pass: Attempted on {tables_attempted_in_delete_pass} tables, "
+                  f"Successfully deleted from {tables_deleted_successfully} tables.")
+            if tables_blocked_by_delete_guard:
+                print(f"DELETE Operation Pass: {len(tables_blocked_by_delete_guard)} table(s) blocked by a target-side "
+                      f"trigger/rule: {sorted(tables_blocked_by_delete_guard)}")
+            return
+
         # --- Fetch all data from the source database, in FK-resolved order ---
         # Note: Add relevant parameters for trusted_conn, uid, pwd if not using trusted connection for source
         fetched_data_map = fetch_all_data_from_source(
@@ -312,80 +418,11 @@ def process_data_and_generate_sql(): # Renamed from process_csv_files
 
         # --- PRE-DELETION PASS (reverse FK order: children before parents) ---
         if execute_pre_delete_on_target:
-            print("\n--- Starting Pre-Deletion Pass (child-first / reverse FK order) ---")
             table_names_for_processing = list(reversed(list(fetched_data_map.keys())))
-            print(f"  Delete order: {table_names_for_processing}")
-            for i, current_table_name in enumerate(table_names_for_processing):
-                tables_attempted_in_delete_pass += 1
-                print(f"\nPre-Deleting from table ({tables_attempted_in_delete_pass}/{len(table_names_for_processing)}): '{current_table_name}'")
-                
-                if not source_where_column or source_where_column.strip() == "":
-                    print(f"  WARNING: `source_where_column` is not defined or empty. Skipping pre-delete for table '{current_table_name}'.")
-                    continue
-
-                cursor = None
-                try:
-                    cursor = target_db_conn.cursor()
-                    # Check if table exists before attempting delete to avoid errors on non-existent tables
-                    # (though get_table_schema_info in the data pass would also catch this,
-                    #  doing a light check here can make pre-delete more robust if table list is dynamic)
-                    # For simplicity now, assume tables exist if they are in fetched_data_map.
-                    # A more robust check: cursor.tables(table=current_table_name, tableType='TABLE').fetchone()
-
-                    operator = '<>' if source_where_negate else '='
-                    delete_sql = f"DELETE FROM [{current_table_name}] WHERE [{source_where_column}] {operator} ?;"
-                    print(f"    Executing: {delete_sql} (Parameter: '{source_where_value}')")
-                    
-                    # Execute the delete command
-                    cursor.execute(delete_sql, source_where_value)
-                    deleted_rows_count = cursor.rowcount
-
-                    # Commit the delete for this table
-                    target_db_conn.commit()
-
-                    # Verify the delete actually took effect: a target-side trigger
-                    # (e.g. an INSTEAD OF DELETE guard) can intercept the DELETE and
-                    # leave matching rows in place while still reporting a rowcount,
-                    # so rowcount alone cannot be trusted as proof of deletion.
-                    verify_sql = f"SELECT COUNT(*) FROM [{current_table_name}] WHERE [{source_where_column}] {operator} ?;"
-                    cursor.execute(verify_sql, source_where_value)
-                    remaining_row_count = cursor.fetchone()[0]
-
-                    if remaining_row_count > 0:
-                        print(f"    WARNING: {remaining_row_count} row(s) still present in '{current_table_name}' after DELETE + commit. "
-                              f"The delete was likely intercepted by a trigger or blocked by a business rule (e.g. an INSTEAD OF DELETE guard). "
-                              f"Skipping data insert for this table to avoid a certain PK violation.")
-                        tables_blocked_by_delete_guard.add(current_table_name)
-                    else:
-                        print(f"    Successfully deleted {deleted_rows_count if deleted_rows_count != -1 else 'an unconfirmed number of'} rows from '{current_table_name}' and committed changes.")
-                        tables_deleted_successfully += 1
-
-                except pyodbc.Error as del_err:
-                    error_code = del_err.args[0]
-                    error_message = str(del_err)
-                    print(f"    DATABASE ERROR during Pre-Delete for table '{current_table_name}' (Code: {error_code}): {error_message}")
-                    print(f"      Query attempted: {delete_sql} with param '{source_where_value}'")
-                    try:
-                        # Rollback in case the error left the transaction in an uncommittable state
-                        target_db_conn.rollback()
-                        print(f"    Rolled back transaction for table '{current_table_name}' due to pre-delete error.")
-                    except pyodbc.Error as rb_err:
-                        print(f"      CRITICAL: Failed to ROLLBACK after pre-delete error for table '{current_table_name}': {rb_err}. Connection might be unstable.")
-                except Exception as e_del_generic:
-                    print(f"    UNEXPECTED NON-DATABASE ERROR during Pre-Delete for table '{current_table_name}': {e_del_generic}")
-                    # Non-pyodbc errors might not require a DB rollback unless a transaction was started and not handled by pyodbc layer.
-                    # For safety, attempt rollback if connection seems active.
-                    if target_db_conn and not target_db_conn.closed : # Check if connection is usable
-                        try:
-                            target_db_conn.rollback()
-                            print(f"    Attempted rollback for table '{current_table_name}' due to unexpected pre-delete error.")
-                        except pyodbc.Error as rb_err:
-                             print(f"      CRITICAL: Failed to ROLLBACK after unexpected pre-delete error for table '{current_table_name}': {rb_err}. Connection might be unstable.")
-                finally:
-                    if cursor:
-                        cursor.close()
-            print("--- Pre-Deletion Pass Complete ---")
-            print("-" * 40)
+            tables_attempted_in_delete_pass, tables_deleted_successfully, tables_blocked_by_delete_guard = run_delete_pass(
+                table_names_for_processing, target_db_conn, source_where_column, source_where_value, source_where_negate,
+                pass_label="Pre-Deletion"
+            )
         else:
             print("\nSkipping Pre-Deletion Pass as `execute_pre_delete_on_target` is False.")
             print("-" * 40)
@@ -686,7 +723,7 @@ def fetch_all_data_from_source(
 
 # --- SCRIPT EXECUTION ---
 if __name__ == '__main__':
-    if operation_mode.upper() not in ['INSERT', 'UPDATE']:
+    if operation_mode.upper() not in ['INSERT', 'UPDATE', 'DELETE']:
         print(f"Error: Invalid operation_mode '{operation_mode}'. Script will not run.")
     else:
         process_data_and_generate_sql() # Updated function call

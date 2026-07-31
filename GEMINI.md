@@ -20,7 +20,7 @@ Here is a map of the repository's files to guide your context gathering:
 
 | Script Path | Primary Role | Core Dependencies | Key Configuration Parameters |
 | :--- | :--- | :--- | :--- |
-| [`tables_modifications.py`](file:///C:/Barao/Projetos/pythonScripts/tables_modifications.py) | Dynamic table data sync with pre-delete & update/insert engines. | `pandas`, `pyodbc` | `source_where_column`, `source_where_value`, `source_where_negate`, `execute_pre_delete_on_target`, `operation_mode`, `primary_key_column` |
+| [`tables_modifications.py`](file:///C:/Barao/Projetos/pythonScripts/tables_modifications.py) | Dynamic table data sync with pre-delete & insert/update/delete engines. | `pandas`, `pyodbc` | `source_where_column`, `source_where_value`, `source_where_negate`, `execute_pre_delete_on_target`, `operation_mode` (`INSERT`\|`UPDATE`\|`DELETE`), `primary_key_column` |
 | [`db_sync.py`](file:///C:/Barao/Projetos/pythonScripts/db_sync.py) | Replicates tables, views, procedures, UDFs, and triggers. | `pyodbc`, `sys` | `SOURCE_CONN_STR`, `DEST_CONN_STR` |
 | [`strings_finder.py`](file:///C:/Barao/Projetos/pythonScripts/strings_finder.py) | CLI text analyzer for unique/repeated substrings. | `argparse`, `collections` | Mode argument (`repeated` \| `unique`) |
 | [`cnpj_unmasked.py`](file:///C:/Barao/Projetos/pythonScripts/cnpj_unmasked.py) | Punctuation cleaning filter for CNPJ lists. | `re` | `file_path` |
@@ -34,7 +34,7 @@ If the user asks you to modify table synchronization, pay close attention to str
 - **Testing Compilation**: Run `python -m py_compile tables_modifications.py` to assert syntactic correctness.
 - **Handling Data Filter Negations**:
   - The `source_where_negate` boolean controls whether queries use `=` (equals) or `<>` (not equals).
-  - Both data fetching (`fetch_data_for_table`) and pre-deletion pass run this dynamic operator logic:
+  - Data fetching (`fetch_data_for_table`) and the shared delete pass (`run_delete_pass`, used by both the pre-deletion pass and `operation_mode = 'DELETE'`) run this dynamic operator logic:
     ```python
     operator = '<>' if negate else '='
     ```

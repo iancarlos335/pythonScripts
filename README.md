@@ -14,11 +14,12 @@ The toolbox is divided into database engineering tools and high-efficiency text 
 A powerful row-by-row table synchronizer that fetches records from a source database, performs target schema metadata mapping (identifying timestamps, column types, and identity settings), converts types automatically, and securely inserts/updates target databases.
 - **Key Features**:
   - Direct database-to-database data transfer (removes need for intermediate CSV files).
-  - Dynamic `INSERT` / `UPDATE` operation mode generation.
+  - Dynamic `INSERT` / `UPDATE` / `DELETE` operation mode generation.
   - Automatic conversion of Python primitives and Pandas `NaN`/`None` into standard `SQL NULL` parameters.
   - Smart handling of Microsoft SQL Server `IDENTITY_INSERT` states.
   - **Flexible WHERE Filter & Negation**: Filter records based on `source_where_column` and `source_where_value`. Supports conditional negation using `source_where_negate = True` (converts query operators from `=` to `<>`).
   - **Target Pre-deletion**: Delete rows matching/excluding the where filter on the target database prior to executing writes.
+  - **`DELETE` Operation Mode**: Deletes rows on the target matching/excluding the where filter directly — no source database connection or SELECT is performed, since the delete is set-based and driven entirely by `source_where_column`/`source_where_value`.
   - **FK-Aware Table Ordering**: Automatically reorders the tables listed in `tables_to_fetch.txt` based on foreign key relationships in the target database — parent tables are inserted/updated before their children, and pre-deletion runs in the reverse (child-first) order, avoiding FK constraint violations.
 
 #### 🔄 [db_sync.py](file:///C:/Barao/Projetos/pythonScripts/db_sync.py)
@@ -78,10 +79,11 @@ These scripts rely on **`pyodbc`** and Microsoft's **ODBC Driver for SQL Server*
    source_where_value = '2026'
    source_where_negate = False  # Set to True if you want to sync all years EXCEPT 2026 (<>)
    
-   operation_mode = 'INSERT'  # Or 'UPDATE'
+   operation_mode = 'INSERT'  # Or 'UPDATE' / 'DELETE'
    primary_key_column = 'ID'  # Required if operation_mode is 'UPDATE'
-   execute_pre_delete_on_target = True  # Clean target records under WHERE condition before inserting
+   execute_pre_delete_on_target = True  # Clean target records under WHERE condition before inserting (ignored if operation_mode is 'DELETE')
    ```
+   > `operation_mode = 'DELETE'` deletes rows on the target under the WHERE condition and skips the source fetch entirely — no `source_db_*` connection is made.
 4. Run the script:
    ```bash
    python tables_modifications.py
