@@ -337,6 +337,85 @@ def get_scalar_value_from_row(r, column_name, df_ref):
     return val  # val is already a scalar
 
 
+def normalize_bound_value(value, is_numeric=False):
+    """Convert pandas missing/scalar wrappers to values accepted by pyodbc."""
+    if value is None or pd.isna(value):
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.to_pydatetime()
+    if isinstance(value, bool):
+        return int(value) if is_numeric else value
+    if is_numeric and isinstance(value, str):
+        normalized = value.strip()
+        if normalized.lower() in ("true", "false"):
+            return int(normalized.lower() == "true")
+        if not normalized or normalized.lower() == "none":
+            return None
+    if hasattr(value, "item") and not isinstance(value, (str, bytes)):
+        try:
+            return value.item()
+        except (ValueError, AttributeError):
+            pass
+    return value
+
+
+def get_target_date_types(table_name, db_conn):
+    cursor = db_conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT UPPER(c.name), LOWER(t.name)
+            FROM sys.columns c
+            INNER JOIN sys.tables tbl ON tbl.object_id = c.object_id
+            INNER JOIN sys.types t ON t.user_type_id = c.user_type_id
+            WHERE tbl.name = ?
+        """, table_name)
+        return {row[0]: row[1] for row in cursor.fetchall() if row[1] in
+                ("date", "datetime", "smalldatetime", "datetime2", "datetimeoffset")}
+    finally:
+        cursor.close()
+
+
+def validate_target_dates(table_name, df, date_columns, key_column):
+    """Check native source date values against target SQL Server date type limits."""
+    from datetime import date, datetime
+    from pandas import Timestamp
+    limits = {
+        "date": (date(1, 1, 1), date(9999, 12, 31)),
+        "datetime": (datetime(1753, 1, 1), datetime(9999, 12, 31, 23, 59, 59, 997000)),
+        "smalldatetime": (datetime(1900, 1, 1), datetime(2079, 6, 6, 23, 59)),
+        "datetime2": (datetime(1, 1, 1), datetime(9999, 12, 31, 23, 59, 59, 999999)),
+        "datetimeoffset": (datetime(1, 1, 1), datetime(9999, 12, 31, 23, 59, 59, 999999)),
+    }
+    # caller supplies target date column names; the data type query is cached separately
+    for col in date_columns:
+        if col not in df.columns:
+            continue
+        series = df[col] if not isinstance(df[col], pd.DataFrame) else df[col].iloc[:, 0]
+        for idx, original in series.items():
+            value = normalize_bound_value(original)
+            if value is None:
+                continue
+            if isinstance(value, Timestamp):
+                value = value.to_pydatetime()
+            if isinstance(value, str) or not isinstance(value, (date, datetime)):
+                key = get_scalar_value_from_row(df.loc[idx], key_column, df) if key_column in df.columns else idx
+                print(f"  Invalid date in table '{table_name}', column '{col}', row key '{key}': {original!r}. Expected a native date/datetime value.")
+                return False
+            # Determine compatibility per target column via attached schema mapping.
+            type_name = df.attrs.get("_target_date_types", {}).get(col, "datetime2")
+            lower, upper = limits[type_name]
+            if isinstance(value, datetime) and value.tzinfo is not None:
+                value = value.replace(tzinfo=None)
+            if isinstance(lower, datetime) and isinstance(value, date) and not isinstance(value, datetime):
+                value = datetime.combine(value, datetime.min.time())
+            comparable = value.date() if isinstance(lower, date) and not isinstance(lower, datetime) and isinstance(value, datetime) else value
+            if comparable < lower or comparable > upper:
+                key = get_scalar_value_from_row(df.loc[idx], key_column, df) if key_column in df.columns else idx
+                print(f"  Invalid date in table '{table_name}', column '{col}', row key '{key}': {original!r} is outside target {type_name} range.")
+                return False
+    return True
+
+
 # --- MAIN PROCESSING ---
 def process_data_and_generate_sql(): # Renamed from process_csv_files
     raw_table_names = get_table_names_from_file(table_list_file)
@@ -414,6 +493,23 @@ def process_data_and_generate_sql(): # Renamed from process_csv_files
 
         print(f"\nStarting SQL operations for {len(fetched_data_map)} tables.")
 
+        # Preflight every table's target schema and date values before any pre-delete.
+        preflight_ok = True
+        for table_name, source_df in fetched_data_map.items():
+            all_cols, date_cols, _, _, _, _ = get_table_schema_info(table_name, target_db_conn)
+            source_df.columns = [str(col).strip().upper() for col in source_df.columns]
+            if not all_cols:
+                print(f"  Target schema could not be retrieved for '{table_name}'. No target rows were deleted or modified.")
+                preflight_ok = False
+                continue
+            date_types = get_target_date_types(table_name, target_db_conn)
+            source_df.attrs["_target_date_types"] = date_types
+            if not validate_target_dates(table_name, source_df, date_cols, primary_key_column.upper()):
+                preflight_ok = False
+        if not preflight_ok:
+            print("Target preflight failed. No target rows were deleted or modified.")
+            return
+
         tables_blocked_by_delete_guard = set()
 
         # --- PRE-DELETION PASS (reverse FK order: children before parents) ---
@@ -478,15 +574,9 @@ def process_data_and_generate_sql(): # Renamed from process_csv_files
                 df_processed = df[columns_to_use_in_sql].copy()
                 for col in columns_to_use_in_sql: # Data type conversions
                     if col in date_db_cols:
-                        # ... (date formatting logic remains identical) ...
-                        if isinstance(df_processed[col], pd.DataFrame):
-                            # print(f"    Warning: Duplicate column name '{col}' encountered in date processing...")
-                            for i in range(df_processed[col].shape[1]):
-                                df_processed[col].iloc[:, i] = pd.to_datetime(df_processed[col].iloc[:, i], errors='coerce').apply(lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if pd.notnull(x) else None)
-                        elif isinstance(df_processed[col], pd.Series):
-                            df_processed[col] = pd.to_datetime(df_processed[col], errors='coerce').apply(lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if pd.notnull(x) else None)
-                        # else: print(f"    Warning: Column '{col}' in date_db_cols is neither Series nor DataFrame...")
-                        # print(f"      - Formatted date column: '{col}'")
+                        # Keep source date/datetime objects native for pyodbc binding.
+                        # Do not parse or reformat strings: their locale is ambiguous.
+                        pass
                     elif col in numeric_db_cols:
                         # ... (numeric formatting logic remains identical) ...
                         if isinstance(df_processed[col], pd.DataFrame):
@@ -518,31 +608,28 @@ def process_data_and_generate_sql(): # Renamed from process_csv_files
 
                     for index, row_data in df_processed.iterrows():
                         processed_row_count_for_table += 1
-                        sql_query = ""
-                        # ... (INSERT/UPDATE sql_query construction logic remains identical) ...
                         if operation_mode.upper() == 'INSERT':
-                            values_for_insert = [format_sql_value(get_scalar_value_from_row(row_data, col, df_processed), col in numeric_db_cols) for col in columns_to_use_in_sql]
+                            values = [normalize_bound_value(get_scalar_value_from_row(row_data, col, df_processed), col in numeric_db_cols) for col in columns_to_use_in_sql]
                             columns_for_insert_sql = ", ".join([f"[{col}]" for col in columns_to_use_in_sql])
-                            sql_query = f"INSERT INTO [{current_table_name}] ({columns_for_insert_sql}) VALUES ({', '.join(values_for_insert)});"
+                            placeholders = ", ".join(["?"] * len(columns_to_use_in_sql))
+                            sql_query = f"INSERT INTO [{current_table_name}] ({columns_for_insert_sql}) VALUES ({placeholders});"
                         elif operation_mode.upper() == 'UPDATE':
                             if pk_col_upper not in columns_to_use_in_sql:
                                 if index == 0: print(f"    Critical Error for UPDATE: PK '{pk_col_upper}' not in usable columns. Skipping row.")
                                 continue
-                            set_clauses = [f"[{col}] = {format_sql_value(get_scalar_value_from_row(row_data, col, df_processed), col in numeric_db_cols)}" for col in columns_to_use_in_sql if col != pk_col_upper]
-                            if not set_clauses:
+                            update_cols = [col for col in columns_to_use_in_sql if col != pk_col_upper]
+                            if not update_cols:
                                 print(f"    INFO: No columns to update for row (index {index}). Skipping.")
                                 continue
-                            pk_value_formatted = format_sql_value(get_scalar_value_from_row(row_data, pk_col_upper, df_processed), pk_col_upper in numeric_db_cols)
-                            sql_query = f"UPDATE [{current_table_name}] SET {', '.join(set_clauses)} WHERE [{pk_col_upper}] = {pk_value_formatted};"
+                            set_clauses = [f"[{col}] = ?" for col in update_cols]
+                            sql_query = f"UPDATE [{current_table_name}] SET {', '.join(set_clauses)} WHERE [{pk_col_upper}] = ?;"
+                            values = [normalize_bound_value(get_scalar_value_from_row(row_data, col, df_processed), col in numeric_db_cols) for col in update_cols]
+                            values.append(normalize_bound_value(get_scalar_value_from_row(row_data, pk_col_upper, df_processed), pk_col_upper in numeric_db_cols))
                         else:
                             print(f"    ERROR: Invalid operation_mode '{operation_mode}'. Halting.")
                             break
 
-                        if not sql_query:
-                            print(f"        Skipping row {index} due to empty query.")
-                            continue
-
-                        cursor.execute(sql_query)
+                        cursor.execute(sql_query, values)
                         rows_affected_count += cursor.rowcount if cursor.rowcount != -1 else 1
                         if processed_row_count_for_table % log_every_n_rows == 0:
                             print(f"        ... processed {processed_row_count_for_table} rows ...")
