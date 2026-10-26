@@ -72,7 +72,7 @@ def get_table_schema_info(table_name_param, db_conn):
         cursor = db_conn.cursor()
         # This query joins system tables to get column name, data type, and identity property
         schema_query = f"""
-        SELECT 
+        SELECT
             c.name AS ColumnName,
             t.name AS DataTypeName,
             c.is_identity
@@ -84,24 +84,24 @@ def get_table_schema_info(table_name_param, db_conn):
         """
         cursor.execute(schema_query)
         schema_details = cursor.fetchall()
-        
+
         date_type_list = ['date', 'datetime', 'datetime2', 'smalldatetime', 'datetimeoffset']
         timestamp_type_list = ['timestamp', 'rowversion']
         numeric_type_list = ['decimal', 'numeric', 'float', 'real', 'money', 'smallmoney', 'int', 'bigint', 'smallint', 'tinyint', 'bit']
-        
+
         for detail in schema_details:
             col_name_upper = detail.ColumnName.upper()
             data_type_lower = detail.DataTypeName.lower()
 
             all_db_columns.append(col_name_upper)
-            
+
             if data_type_lower in date_type_list:
                 date_db_columns.append(col_name_upper)
             elif data_type_lower in timestamp_type_list:
                 timestamp_db_columns.append(col_name_upper)
             elif data_type_lower in numeric_type_list:
                 numeric_db_columns.append(col_name_upper)
-            
+
             if detail.is_identity:
                 has_identity_column = True
                 identity_column_name = col_name_upper
@@ -310,13 +310,13 @@ def format_sql_value(value, is_numeric):
         if str_val.lower() == 'false':
             return '0'
         return str_val # Numeric values are not quoted
-    
+
     # For non-numeric types (strings, formatted dates)
     str_value_representation = str(value)
     # If the string representation is 'None' (case-insensitive) treat it as NULL
     if str_value_representation.strip().lower() == 'none':
         return 'NULL'
-        
+
     # Escape single quotes and wrap in SQL single quotes for string literals
     escaped_string = str_value_representation.replace("'", "''")
     return f"'{escaped_string}'"
@@ -444,7 +444,7 @@ def process_data_and_generate_sql(): # Renamed from process_csv_files
             if not all_db_cols:
                 print(f"  Skipping data operations for table '{current_table_name}' as no schema was retrieved from TARGET database.")
                 continue
-            
+
             try: # This try is for data preparation for the current table
                 if df.empty:
                     print(f"  Warning: Fetched data for '{current_table_name}' is empty. No data operations to execute.")
@@ -464,7 +464,7 @@ def process_data_and_generate_sql(): # Renamed from process_csv_files
                 common_cols_before_ts_filter = [col for col in csv_cols_standardized if col in all_db_cols]
                 columns_to_use_in_sql = [col for col in common_cols_before_ts_filter if col not in ts_db_cols]
                 excluded_ts_cols = [col for col in common_cols_before_ts_filter if col in ts_db_cols]
-                
+
                 if not columns_to_use_in_sql:
                     print(f"  Warning: No usable columns for table '{current_table_name}' after schema matching. Skipping data operations.")
                     continue
@@ -498,7 +498,7 @@ def process_data_and_generate_sql(): # Renamed from process_csv_files
                             if not pd.api.types.is_numeric_dtype(df_processed[col]):
                                 df_processed[col] = df_processed[col].astype(str).str.replace(',', '.', regex=False)
                         # else: print(f"    Warning: Column '{col}' in numeric_db_cols is neither Series nor DataFrame...")
-                
+
                 # --- SQL Execution Block for Data Operations (INSERT/UPDATE) ---
                 cursor = None
                 table_data_ops_successful = False
@@ -514,7 +514,7 @@ def process_data_and_generate_sql(): # Renamed from process_csv_files
                     pk_col_upper = primary_key_column.upper()
                     rows_affected_count = 0
                     processed_row_count_for_table = 0
-                    log_every_n_rows = 100 
+                    log_every_n_rows = 100
 
                     for index, row_data in df_processed.iterrows():
                         processed_row_count_for_table += 1
@@ -537,11 +537,11 @@ def process_data_and_generate_sql(): # Renamed from process_csv_files
                         else:
                             print(f"    ERROR: Invalid operation_mode '{operation_mode}'. Halting.")
                             break
-                        
+
                         if not sql_query:
                             print(f"        Skipping row {index} due to empty query.")
                             continue
-                        
+
                         cursor.execute(sql_query)
                         rows_affected_count += cursor.rowcount if cursor.rowcount != -1 else 1
                         if processed_row_count_for_table % log_every_n_rows == 0:
@@ -551,7 +551,7 @@ def process_data_and_generate_sql(): # Renamed from process_csv_files
                         identity_insert_off_sql = f"SET IDENTITY_INSERT [{current_table_name}] OFF;"
                         print(f"      Executing: {identity_insert_off_sql}")
                         cursor.execute(identity_insert_off_sql)
-                    
+
                     target_db_conn.commit()
                     print(f"    Successfully committed {rows_affected_count} data operations for table '{current_table_name}'.")
                     table_data_ops_successful = True
@@ -568,22 +568,22 @@ def process_data_and_generate_sql(): # Renamed from process_csv_files
                     if cursor: cursor.close()
                     if table_data_ops_successful: total_tables_committed_successfully += 1
                 # --- End of SQL Execution Block for Data Operations ---
-            
-            except Exception as e_prep: 
+
+            except Exception as e_prep:
                 print(f"  An unexpected error occurred while preparing data for table '{current_table_name}': {e_prep}")
         print("--- Data Insertion/Update Pass Complete ---")
         print("-" * 40)
 
-    except pyodbc.Error as ex: 
+    except pyodbc.Error as ex:
         print(f"Fatal Target Database Connection Error: {ex.args[0]}. Cannot proceed.")
-    except Exception as e: 
+    except Exception as e:
         print(f"An unexpected error occurred during script setup or Target DB connection: {e}")
     finally:
-        if target_db_conn: 
+        if target_db_conn:
             target_db_conn.close()
             print("Target Database connection closed.")
             print("-" * 40)
-    
+
     print(f"\n--- SQL Execution Process Summary ---")
     if execute_pre_delete_on_target:
         print(f"Pre-Deletion Pass: Attempted on {tables_attempted_in_delete_pass} tables, Successfully deleted from {tables_deleted_successfully} tables.")
@@ -591,7 +591,7 @@ def process_data_and_generate_sql(): # Renamed from process_csv_files
             print(f"Pre-Deletion Pass: {len(tables_blocked_by_delete_guard)} table(s) blocked by a target-side trigger/rule — "
                   f"data insert skipped for these tables: {sorted(tables_blocked_by_delete_guard)}")
     print(f"Data Insertion/Update Pass: Attempted on {tables_attempted_in_data_pass} tables, Successfully committed for {total_tables_committed_successfully} tables.")
-    
+
     # Overall success might be defined differently now.
     # For simplicity, let's say total_tables_committed_successfully refers to the data pass.
     failed_data_tables_count = tables_attempted_in_data_pass - total_tables_committed_successfully
@@ -632,7 +632,7 @@ def create_db_connection(server, database, driver, trusted_connection=True, user
         conn_str += 'Trusted_Connection=yes;'
     else:
         conn_str += f'UID={username};PWD={password};'
-    
+
     try:
         conn = pyodbc.connect(conn_str)
         print(f"Successfully connected to database: {database} on server: {server}")
@@ -716,7 +716,7 @@ def fetch_all_data_from_source(
         if db_conn:
             print("\nClosing source database connection.")
             db_conn.close()
-            
+
     print(f"\n--- Source Data Fetching Complete ---")
     print(f"Successfully fetched data for {len(all_data)} out of {len(table_names)} tables.")
     return all_data
